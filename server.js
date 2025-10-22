@@ -51,7 +51,7 @@ async function initBlockchain() {
     ctfContract = new ethers.Contract(CTF_EXCHANGE_ADDRESS, CTF_EXCHANGE_ABI, provider);
     
     const currentBlock = await provider.getBlockNumber();
-    lastProcessedBlock = currentBlock - 100; // Start from 100 blocks ago
+    lastProcessedBlock = currentBlock - 50; // Start from just 50 blocks ago
     
     console.log('⛓️  Connected to Polygon blockchain');
     console.log(`📦 Starting from block ${lastProcessedBlock}`);
@@ -257,17 +257,21 @@ async function processBlockchainEvents() {
       return;
     }
 
-    console.log(`🔍 Scanning blocks ${lastProcessedBlock + 1} to ${currentBlock}...`);
+    // Limit scan to max 50 blocks at a time to avoid "block range too large" error
+    const maxBlockRange = 50;
+    const toBlock = Math.min(currentBlock, lastProcessedBlock + maxBlockRange);
+
+    console.log(`🔍 Scanning blocks ${lastProcessedBlock + 1} to ${toBlock}...`);
 
     // Query OrderFilled events
     const orderFilledFilter = ctfContract.filters.OrderFilled();
     const events = await ctfContract.queryFilter(
       orderFilledFilter,
       lastProcessedBlock + 1,
-      currentBlock
+      toBlock
     );
 
-    console.log(`📊 Found ${events.length} trades in ${currentBlock - lastProcessedBlock} blocks`);
+    console.log(`📊 Found ${events.length} trades in ${toBlock - lastProcessedBlock} blocks`);
 
     for (const event of events) {
       try {
@@ -326,7 +330,7 @@ async function processBlockchainEvents() {
       }
     }
 
-    lastProcessedBlock = currentBlock;
+    lastProcessedBlock = toBlock;
     console.log('✅ Scan complete');
 
   } catch (error) {
