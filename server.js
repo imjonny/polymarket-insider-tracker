@@ -373,15 +373,25 @@ app.listen(PORT, async () => {
   const connected = await initBlockchain();
   
   if (connected) {
-    console.log('⏱️  Starting blockchain monitoring in 10 seconds...');
+    console.log('⏱️  Waiting for next block before monitoring...');
+    console.log('⏱️  This ensures we only catch completely NEW trades');
     
-    setTimeout(() => {
-      console.log('🎯 Starting blockchain monitoring...');
-      processBlockchainEvents();
-      
-      // Scan every CHECK_INTERVAL
-      setInterval(processBlockchainEvents, CONFIG.CHECK_INTERVAL);
-    }, 10000);
+    // Wait for next block to ensure we skip any in-progress transactions
+    const startBlock = await provider.getBlockNumber();
+    
+    const waitForNextBlock = setInterval(async () => {
+      const currentBlock = await provider.getBlockNumber();
+      if (currentBlock > startBlock) {
+        clearInterval(waitForNextBlock);
+        lastProcessedBlock = currentBlock;
+        console.log(`🎯 New block detected! Starting monitoring from block ${currentBlock}...`);
+        
+        processBlockchainEvents();
+        
+        // Scan every CHECK_INTERVAL
+        setInterval(processBlockchainEvents, CONFIG.CHECK_INTERVAL);
+      }
+    }, 3000); // Check every 3 seconds
   } else {
     console.error('❌ Failed to initialize blockchain connection');
   }
