@@ -51,10 +51,10 @@ async function initBlockchain() {
     ctfContract = new ethers.Contract(CTF_EXCHANGE_ADDRESS, CTF_EXCHANGE_ABI, provider);
     
     const currentBlock = await provider.getBlockNumber();
-    lastProcessedBlock = currentBlock - 50; // Start from just 50 blocks ago
+    lastProcessedBlock = currentBlock; // Start from NOW, not historical blocks
     
     console.log('⛓️  Connected to Polygon blockchain');
-    console.log(`📦 Starting from block ${lastProcessedBlock}`);
+    console.log(`📦 Starting from current block ${lastProcessedBlock} (no historical data)`);
     return true;
   } catch (error) {
     console.error('❌ Failed to connect to blockchain:', error.message);
@@ -277,15 +277,24 @@ async function processBlockchainEvents() {
       try {
         const { maker, makerAssetId, makerAmountFilled, orderHash } = event.args;
         
-        // Check if already alerted
-        if (alertedTrades.has(orderHash)) continue;
-
         // Calculate trade amount (simplified - assumes $0.50 average price)
         // In reality, you'd need to calculate from makerAmountFilled and price
         const tradeAmount = parseFloat(ethers.formatUnits(makerAmountFilled, 6)); // USDC has 6 decimals
         
         // Check if meets minimum
         if (tradeAmount < CONFIG.MIN_BET_AMOUNT) continue;
+
+        // Create a more robust unique identifier to prevent duplicates
+        // Combines: wallet + amount (rounded to nearest 100) + asset + date
+        const today = new Date().toISOString().split('T')[0];
+        const roundedAmount = Math.floor(tradeAmount / 100) * 100;
+        const alertKey = `${maker.toLowerCase()}-${roundedAmount}-${makerAssetId.toString().slice(-8)}-${today}`;
+        
+        // Check if already alerted using the new key
+        if (alertedTrades.has(alertKey)) {
+          console.log(`   ↳ Skipping: Already alerted for this trade today`);
+          continue;
+        }
 
         console.log(`💵 Large trade detected: $${tradeAmount.toLocaleString()} from ${maker.slice(0, 6)}...${maker.slice(-4)}`);
 
@@ -314,8 +323,8 @@ async function processBlockchainEvents() {
         // Send alert
         await sendDiscordAlert(tradeData, walletInfo, market);
 
-        // Mark as alerted
-        alertedTrades.add(orderHash);
+        // Mark as alerted using the composite key
+        alertedTrades.add(alertKey);
 
         // Prevent memory leak
         if (alertedTrades.size > MAX_STORED_ALERTS) {
