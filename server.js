@@ -308,9 +308,20 @@ async function processBlockchainEvents() {
 
         console.log(`🚨 NEW WALLET LARGE TRADE: $${tradeAmount.toLocaleString()} - ${walletInfo.description}`);
 
-        // Get market info
+        // Get market info and validate it's active
         const conditionId = makerAssetId.toString().slice(0, 66); // Approximate condition ID extraction
         const market = await getMarketByConditionId(conditionId);
+
+        // Skip if market is closed, resolved, or doesn't exist
+        if (!market) {
+          console.log(`   ↳ Skipping: Could not find market info`);
+          continue;
+        }
+        
+        if (market.closed === true || market.active === false) {
+          console.log(`   ↳ Skipping: Market is closed or inactive`);
+          continue;
+        }
 
         // Prepare trade data
         const tradeData = {
