@@ -1,7 +1,7 @@
 {
   "name": "polymarket-insider-tracker",
-  "version": "1.0.0",
-  "description": "Track potential insider trading on Polymarket",
+  "version": "2.0.0",
+  "description": "Track potential insider trading on Polymarket using blockchain monitoring",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "ethers": "^6.9.0"
   },
   "engines": {
     "node": "18.x"
