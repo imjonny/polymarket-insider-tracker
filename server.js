@@ -1,178 +1,237 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { ethers } = require('ethers');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Configuration from environment variables
+// Configuration
 const CONFIG = {
   DISCORD_WEBHOOK: process.env.DISCORD_WEBHOOK || '',
   MIN_BET_AMOUNT: parseFloat(process.env.MIN_BET_AMOUNT) || 10000,
   NEW_ACCOUNT_DAYS: parseInt(process.env.NEW_ACCOUNT_DAYS) || 7,
-  CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL) || 60000, // 60 seconds
+  CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL) || 30000, // 30 seconds
+  POLYGON_RPC: process.env.POLYGON_RPC || 'https://polygon-rpc.com',
 };
 
-// In-memory store to prevent duplicate alerts
-const alertedOrders = new Set();
-const MAX_STORED_ALERTS = 10000;
+// Polymarket CTF Exchange contract address on Polygon
+const CTF_EXCHANGE_ADDRESS = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 
-// Polymarket API endpoints
+// Simplified ABI for the events we care about
+const CTF_EXCHANGE_ABI = [
+  'event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)',
+  'event OrdersMatched(bytes32 indexed takerOrderHash, address indexed takerOrderMaker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee)'
+];
+
+// In-memory stores
+const alertedTrades = new Set();
+const walletFirstSeen = new Map();
+const MAX_STORED_ALERTS = 5000;
+
+// Polymarket API for market info
 const GAMMA_API = 'https://gamma-api.polymarket.com';
-const CLOB_API = 'https://clob.polymarket.com';
 
-console.log('🚀 Polymarket Insider Trading Tracker Started');
+let provider;
+let ctfContract;
+let lastProcessedBlock = 0;
+
+console.log('🚀 Polymarket Insider Trading Tracker - BLOCKCHAIN EDITION');
 console.log('⚙️  Min bet amount: $' + CONFIG.MIN_BET_AMOUNT.toLocaleString());
 console.log('⏱️  New account threshold: ' + CONFIG.NEW_ACCOUNT_DAYS + ' days');
 console.log('🔔 Discord alerts: ' + (CONFIG.DISCORD_WEBHOOK ? '✅ ENABLED' : '❌ DISABLED'));
 
 /**
- * Fetch active markets from Polymarket
+ * Initialize blockchain connection
  */
-async function getActiveMarkets() {
+async function initBlockchain() {
+  try {
+    provider = new ethers.JsonRpcProvider(CONFIG.POLYGON_RPC);
+    ctfContract = new ethers.Contract(CTF_EXCHANGE_ADDRESS, CTF_EXCHANGE_ABI, provider);
+    
+    const currentBlock = await provider.getBlockNumber();
+    lastProcessedBlock = currentBlock - 100; // Start from 100 blocks ago
+    
+    console.log('⛓️  Connected to Polygon blockchain');
+    console.log(`📦 Starting from block ${lastProcessedBlock}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to connect to blockchain:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Check wallet age on blockchain
+ */
+async function checkWalletAge(address) {
+  try {
+    // Check if we've seen this wallet before
+    if (walletFirstSeen.has(address)) {
+      const firstSeenTime = walletFirstSeen.get(address);
+      const ageInDays = Math.floor((Date.now() - firstSeenTime) / (1000 * 60 * 60 * 24));
+      return {
+        isNew: ageInDays <= CONFIG.NEW_ACCOUNT_DAYS,
+        ageInDays: ageInDays,
+        description: ageInDays === 0 ? '🆕 Brand New - First Trade Today!' : `🆕 ${ageInDays} days old`
+      };
+    }
+
+    // Get wallet's transaction history to determine age
+    const txCount = await provider.getTransactionCount(address);
+    
+    // If very few transactions, likely a new wallet
+    if (txCount <= 10) {
+      // Try to find first transaction
+      try {
+        // Search recent blocks for first appearance
+        const currentBlock = await provider.getBlockNumber();
+        const blocksToSearch = Math.min(10000, currentBlock); // Search up to 10k blocks back (~5 hours on Polygon)
+        
+        let firstTxBlock = currentBlock;
+        
+        // Binary search for first transaction (approximate)
+        for (let i = 0; i < 5; i++) {
+          const midBlock = Math.floor((currentBlock - blocksToSearch + firstTxBlock) / 2);
+          const balance = await provider.getBalance(address, midBlock);
+          if (balance > 0) {
+            firstTxBlock = midBlock;
+          }
+        }
+        
+        const block = await provider.getBlock(firstTxBlock);
+        const firstSeenTimestamp = block.timestamp * 1000;
+        const ageInMs = Date.now() - firstSeenTimestamp;
+        const ageInDays = Math.floor(ageInMs / (1000 * 60 * 60 * 24));
+        
+        // Store for future reference
+        walletFirstSeen.set(address, firstSeenTimestamp);
+        
+        return {
+          isNew: ageInDays <= CONFIG.NEW_ACCOUNT_DAYS,
+          ageInDays: ageInDays,
+          description: ageInDays === 0 ? '🆕 Brand New - First Trade Today!' : `🆕 ${ageInDays} days old`
+        };
+      } catch (err) {
+        // If we can't determine age precisely, mark as potentially new
+        return {
+          isNew: true,
+          ageInDays: 0,
+          description: '🆕 New Wallet (Low Transaction Count)'
+        };
+      }
+    }
+    
+    // Wallet has many transactions, likely not new
+    return {
+      isNew: false,
+      ageInDays: 999,
+      description: `Established wallet (${txCount} transactions)`
+    };
+    
+  } catch (error) {
+    console.error(`⚠️  Error checking wallet age for ${address}:`, error.message);
+    // On error, assume it might be new to be safe
+    return {
+      isNew: true,
+      ageInDays: 0,
+      description: '🆕 Unknown Age (Error checking blockchain)'
+    };
+  }
+}
+
+/**
+ * Get market info from condition ID
+ */
+async function getMarketByConditionId(conditionId) {
   try {
     const response = await axios.get(`${GAMMA_API}/markets`, {
       params: {
-        limit: 100,
-        closed: false,
-        active: true
+        condition_id: conditionId,
+        limit: 1
       },
       timeout: 10000
     });
-    return response.data || [];
-  } catch (error) {
-    console.error('⚠️  Error fetching markets:', error.message);
-    return [];
-  }
-}
-
-/**
- * Fetch recent trades for a specific market
- */
-async function getMarketTrades(conditionId) {
-  try {
-    const response = await axios.get(`${CLOB_API}/trades`, {
-      params: {
-        market: conditionId,
-        limit: 20
-      },
-      timeout: 10000
-    });
-    return response.data || [];
-  } catch (error) {
-    console.error('⚠️  Error fetching trades:', error.message);
-    return [];
-  }
-}
-
-/**
- * Get user information from Polymarket
- */
-async function getUserInfo(address) {
-  try {
-    const response = await axios.get(`${GAMMA_API}/users/${address}`, {
-      timeout: 10000
-    });
-    return response.data;
+    
+    if (response.data && response.data.length > 0) {
+      return response.data[0];
+    }
+    return null;
   } catch (error) {
     return null;
   }
 }
 
 /**
- * Check if account is new (within threshold)
+ * Convert asset ID to readable outcome (YES/NO)
  */
-function checkAccountAge(userData) {
-  if (!userData || !userData.createdAt) {
-    return { isNew: true, description: 'Unknown (No creation date)' };
-  }
-
-  try {
-    const createdAt = userData.createdAt;
-    const createdDate = new Date(createdAt > 10000000000 ? createdAt : createdAt * 1000);
-    const now = new Date();
-    const ageInDays = Math.floor((now - createdDate) / (1000 * 60 * 60 * 24));
-
-    if (ageInDays <= CONFIG.NEW_ACCOUNT_DAYS) {
-      if (ageInDays === 0) {
-        return { isNew: true, description: '🆕 Brand New Account - Created Today!' };
-      } else if (ageInDays === 1) {
-        return { isNew: true, description: '🆕 New Account - Created Yesterday' };
-      } else {
-        return { isNew: true, description: `🆕 New Account - ${ageInDays} days old` };
-      }
-    } else {
-      return { isNew: false, description: `Account age: ${ageInDays} days` };
-    }
-  } catch (error) {
-    return { isNew: true, description: 'Unknown (Error parsing date)' };
-  }
+function getOutcomeFromAssetId(assetId) {
+  // In Polymarket's CTF, asset IDs encode the position
+  // This is a simplified version - the actual mapping is more complex
+  const assetIdStr = assetId.toString();
+  const lastDigit = parseInt(assetIdStr[assetIdStr.length - 1]);
+  
+  // Even = NO, Odd = YES (simplified heuristic)
+  return lastDigit % 2 === 0 ? 'NO ❌' : 'YES ✅';
 }
 
 /**
- * Send alert to Discord
+ * Send Discord alert
  */
-async function sendDiscordAlert(market, trade, userData, accountAgeDesc) {
+async function sendDiscordAlert(tradeData, walletInfo, market) {
   if (!CONFIG.DISCORD_WEBHOOK) {
-    console.log('⚠️  Discord webhook not configured, skipping alert');
     return;
   }
 
   try {
-    // Determine YES or NO position
-    const outcome = trade.outcome || trade.asset_id || '';
-    let position = 'UNKNOWN';
+    const marketUrl = market && market.slug 
+      ? `https://polymarket.com/event/${market.slug}`
+      : 'https://polymarket.com';
     
-    if (outcome.toLowerCase().includes('yes') || outcome === '1') {
-      position = 'YES ✅';
-    } else if (outcome.toLowerCase().includes('no') || outcome === '0') {
-      position = 'NO ❌';
-    }
+    const marketTitle = market 
+      ? (market.question || market.title || 'Unknown Market')
+      : 'Unknown Market (Check Polymarket)';
 
-    // Calculate bet amount
-    const price = parseFloat(trade.price || 0);
-    const size = parseFloat(trade.size || 0);
-    const betAmount = price * size;
-
-    // Create market URL
-    const marketSlug = market.slug || market.market_slug || '';
-    const marketUrl = marketSlug ? `https://polymarket.com/event/${marketSlug}` : 'N/A';
-
-    // Build Discord embed
     const embed = {
       title: '🚨 POTENTIAL INSIDER TRADING DETECTED',
-      color: 0xFF0000, // Red color
+      description: 'Large bet from a brand new wallet detected on-chain!',
+      color: 0xFF0000,
       fields: [
         {
           name: '📊 Market',
-          value: market.question || market.title || 'Unknown Market',
+          value: marketTitle,
           inline: false
         },
         {
           name: '💰 Bet Amount',
-          value: `$${betAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+          value: `$${tradeData.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
           inline: true
         },
         {
           name: '🎯 Position',
-          value: position,
+          value: tradeData.outcome,
           inline: true
         },
         {
-          name: '👤 Account Age',
-          value: accountAgeDesc,
+          name: '👤 Wallet Age',
+          value: walletInfo.description,
+          inline: false
+        },
+        {
+          name: '🔗 Wallet Address',
+          value: `[${tradeData.wallet.slice(0, 6)}...${tradeData.wallet.slice(-4)}](https://polygonscan.com/address/${tradeData.wallet})`,
           inline: false
         },
         {
           name: '🔗 Market Link',
-          value: marketUrl !== 'N/A' ? `[View Market](${marketUrl})` : 'N/A',
+          value: `[View Market](${marketUrl})`,
           inline: false
         }
       ],
       timestamp: new Date().toISOString(),
       footer: {
-        text: 'Polymarket Insider Trading Tracker'
+        text: 'Polymarket Insider Trading Tracker • On-Chain Detection'
       }
     };
 
@@ -187,112 +246,136 @@ async function sendDiscordAlert(market, trade, userData, accountAgeDesc) {
 }
 
 /**
- * Main monitoring function
+ * Process blockchain events
  */
-async function monitorMarkets() {
-  console.log('🔍 Checking for suspicious activity...');
+async function processBlockchainEvents() {
+  try {
+    const currentBlock = await provider.getBlockNumber();
+    
+    if (currentBlock <= lastProcessedBlock) {
+      console.log('📦 No new blocks to process');
+      return;
+    }
 
-  const markets = await getActiveMarkets();
-  console.log(`📊 Found ${markets.length} active markets`);
+    console.log(`🔍 Scanning blocks ${lastProcessedBlock + 1} to ${currentBlock}...`);
 
-  for (const market of markets.slice(0, 20)) { // Check top 20 markets to avoid rate limits
-    try {
-      const conditionId = market.condition_id || market.conditionId;
-      if (!conditionId) continue;
+    // Query OrderFilled events
+    const orderFilledFilter = ctfContract.filters.OrderFilled();
+    const events = await ctfContract.queryFilter(
+      orderFilledFilter,
+      lastProcessedBlock + 1,
+      currentBlock
+    );
 
-      const trades = await getMarketTrades(conditionId);
+    console.log(`📊 Found ${events.length} trades in ${currentBlock - lastProcessedBlock} blocks`);
 
-      for (const trade of trades) {
-        const tradeId = trade.id || trade.trade_id;
-        if (!tradeId || alertedOrders.has(tradeId)) continue;
+    for (const event of events) {
+      try {
+        const { maker, makerAssetId, makerAmountFilled, orderHash } = event.args;
+        
+        // Check if already alerted
+        if (alertedTrades.has(orderHash)) continue;
 
-        // Calculate trade size
-        const price = parseFloat(trade.price || 0);
-        const size = parseFloat(trade.size || 0);
-        const tradeAmount = price * size;
-
-        // Check if trade meets minimum amount
+        // Calculate trade amount (simplified - assumes $0.50 average price)
+        // In reality, you'd need to calculate from makerAmountFilled and price
+        const tradeAmount = parseFloat(ethers.formatUnits(makerAmountFilled, 6)); // USDC has 6 decimals
+        
+        // Check if meets minimum
         if (tradeAmount < CONFIG.MIN_BET_AMOUNT) continue;
 
-        console.log(`💵 Large trade detected: $${tradeAmount.toLocaleString()} on ${market.question || 'Unknown'}`);
+        console.log(`💵 Large trade detected: $${tradeAmount.toLocaleString()} from ${maker.slice(0, 6)}...${maker.slice(-4)}`);
 
-        // Get user info
-        const userAddress = trade.maker_address || trade.maker || trade.user;
-        if (!userAddress) continue;
-
-        const userData = await getUserInfo(userAddress);
-        const accountAge = checkAccountAge(userData);
-
-        // Only alert on new accounts
-        if (accountAge.isNew) {
-          console.log(`🚨 NEW ACCOUNT LARGE TRADE: $${tradeAmount.toLocaleString()}`);
-
-          // Send Discord alert
-          await sendDiscordAlert(market, trade, userData, accountAge.description);
-
-          // Mark as alerted
-          alertedOrders.add(tradeId);
-
-          // Prevent memory leak by limiting stored alerts
-          if (alertedOrders.size > MAX_STORED_ALERTS) {
-            const firstItem = alertedOrders.values().next().value;
-            alertedOrders.delete(firstItem);
-          }
+        // Check wallet age
+        const walletInfo = await checkWalletAge(maker);
+        
+        if (!walletInfo.isNew) {
+          console.log(`   ↳ Skipping: Wallet is ${walletInfo.ageInDays} days old (not new enough)`);
+          continue;
         }
 
-        // Small delay to avoid rate limits
-        await new Promise(resolve => setTimeout(resolve, 100));
+        console.log(`🚨 NEW WALLET LARGE TRADE: $${tradeAmount.toLocaleString()} - ${walletInfo.description}`);
+
+        // Get market info
+        const conditionId = makerAssetId.toString().slice(0, 66); // Approximate condition ID extraction
+        const market = await getMarketByConditionId(conditionId);
+
+        // Prepare trade data
+        const tradeData = {
+          wallet: maker,
+          amount: tradeAmount,
+          outcome: getOutcomeFromAssetId(makerAssetId),
+          orderHash: orderHash
+        };
+
+        // Send alert
+        await sendDiscordAlert(tradeData, walletInfo, market);
+
+        // Mark as alerted
+        alertedTrades.add(orderHash);
+
+        // Prevent memory leak
+        if (alertedTrades.size > MAX_STORED_ALERTS) {
+          const firstItem = alertedTrades.values().next().value;
+          alertedTrades.delete(firstItem);
+        }
+
+        // Rate limit
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (err) {
+        console.error('⚠️  Error processing event:', err.message);
       }
-
-      // Delay between markets
-      await new Promise(resolve => setTimeout(resolve, 500));
-    } catch (error) {
-      console.error(`⚠️  Error processing market:`, error.message);
     }
-  }
 
-  console.log('✅ Scan complete');
+    lastProcessedBlock = currentBlock;
+    console.log('✅ Scan complete');
+
+  } catch (error) {
+    console.error('❌ Error scanning blockchain:', error.message);
+  }
 }
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok',
-    uptime: process.uptime(),
+    status: 'healthy',
+    uptime: Math.floor(process.uptime()),
+    lastBlock: lastProcessedBlock,
     config: {
       minBetAmount: CONFIG.MIN_BET_AMOUNT,
       newAccountDays: CONFIG.NEW_ACCOUNT_DAYS,
       discordEnabled: !!CONFIG.DISCORD_WEBHOOK
     },
-    alertsTracked: alertedOrders.size
-  });
-});
-
-// Status endpoint
-app.get('/status', (req, res) => {
-  res.json({
-    running: true,
-    alertsTracked: alertedOrders.size,
-    uptime: process.uptime()
+    stats: {
+      alertsSent: alertedTrades.size,
+      walletsTracked: walletFirstSeen.size
+    }
   });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🌐 Server running on port ${PORT}`);
-  console.log(`📊 Monitoring starting in 10 seconds...`);
-
-  // Start monitoring after a short delay
-  setTimeout(() => {
-    monitorMarkets();
-    // Run checks at the configured interval
-    setInterval(monitorMarkets, CONFIG.CHECK_INTERVAL);
-  }, 10000);
+  
+  const connected = await initBlockchain();
+  
+  if (connected) {
+    console.log('⏱️  Starting blockchain monitoring in 10 seconds...');
+    
+    setTimeout(() => {
+      console.log('🎯 Starting blockchain monitoring...');
+      processBlockchainEvents();
+      
+      // Scan every CHECK_INTERVAL
+      setInterval(processBlockchainEvents, CONFIG.CHECK_INTERVAL);
+    }, 10000);
+  } else {
+    console.error('❌ Failed to initialize blockchain connection');
+  }
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('👋 Shutting down gracefully...');
+  console.log('👋 Shutting down...');
   process.exit(0);
 });
